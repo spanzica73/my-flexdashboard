@@ -1,0 +1,273 @@
+---
+title: "NASA Meteorite Landings Explorer"
+author: "Sam Panzica"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    theme:
+      version: 4
+      bootswatch: flatly
+    source_code: embed
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(tidyverse)
+library(janitor)
+library(plotly)
+library(leaflet)
+library(DT)
+library(crosstalk)
+library(scales)
+
+max_found <- 8000
+set.seed(8030)
+
+# ---- Import --------
+raw <- read_csv("Meteorite_Landings.csv", show_col_types = FALSE)
+
+# ---- Tidy + Transform ------
+meteorites <- raw |>
+  clean_names() |>
+  rename(any_of(c(mass_g = "mass", lat = "reclat", long = "reclong"))) |>
+  mutate(
+    year = as.integer(str_extract(as.character(year), "\\d{4}"))
+  ) |>
+  filter(
+    nametype == "Valid",
+    !is.na(year), !is.na(lat), !is.na(long), !is.na(mass_g),
+    mass_g > 0,
+    !(lat == 0 & long == 0),
+    year >= 860, year <= as.integer(format(Sys.Date(), "%Y"))
+  ) |>
+  mutate(
+    decade    = floor(year / 10) * 10,
+    mass_kg   = mass_g / 1000,
+    log_mass  = round(log10(mass_g), 2),
+    class_group = case_when(
+      str_detect(recclass, "^(H|L|LL)($|[0-9~/(-])")      ~ "Ordinary chondrite",
+      str_detect(recclass, "^C(I|M|O|V|K|R|B|H)|^C$|^C[0-9]") ~ "Carbonaceous chondrite",
+      str_detect(recclass, "^E[HL]?[0-9]")                ~ "Enstatite chondrite",
+      str_detect(recclass, "^Iron")                       ~ "Iron",
+      str_detect(recclass, "Pallasite|Mesosiderite")      ~ "Stony-iron",
+      str_detect(recclass, "Eucrite|Diogenite|Howardite|Martian|Lunar|Angrite|Aubrite|Ureilite|Acapulcoite|Lodranite|Brachinite") ~ "Achondrite",
+      TRUE                                                ~ "Other / unclassified"
+    ),
+    class_group = factor(class_group)
+  ) |>
+  select(name, id, recclass, class_group, fall, year, decade,
+         mass_g, mass_kg, log_mass, lat, long)
+
+
+map_df <- bind_rows(
+  meteorites |> filter(fall == "Fell"),
+  meteorites |> filter(fall == "Found") |> slice_sample(n = max_found)
+) |>
+  mutate(
+    lat  = round(lat, 3),
+    long = round(long, 3),
+    popup = paste0(
+      "<b>", name, "</b><br>",
+      "Class: ", recclass, "<br>",
+      "Year: ", year, " (", fall, ")<br>",
+      "Mass: ", comma(mass_g), " g"
+    )
+  )
+
+sd <- SharedData$new(map_df)
+fall_pal <- colorFactor(c("darkgreen", "lightblue"), domain = c("Fell", "Found"))
+```
+
+```{css, echo=FALSE}
+.sidebar { padding-left: 15px; padding-right: 15px; }
+```
+Overview
+=====================================
+
+Row
+-------------------------------------
+
+### Meteorites in dataset
+
+```{r}
+valueBox(comma(nrow(meteorites)), icon = "fa-globe", color = "primary")
+```
+
+### Observed falls
+
+```{r}
+valueBox(comma(sum(meteorites$fall == "Fell")),
+         caption = "Observed falls", icon = "fa-eye", color = "danger")
+```
+
+### Heaviest specimen
+
+```{r}
+heaviest <- meteorites |> slice_max(mass_g, n = 1, with_ties = FALSE)
+valueBox(paste0(heaviest$name, " (", comma(heaviest$mass_kg / 1000), " t)"),
+         icon = "fa-weight-hanging", color = "warning")
+```
+
+### Median mass
+
+```{r}
+valueBox(paste(comma(median(meteorites$mass_g)), "g"),
+         icon = "fa-balance-scale", color = "info")
+```
+
+Row
+-------------------------------------
+
+### Recorded meteorites by decade
+
+```{r}
+by_decade <- meteorites |> count(decade, fall)
+
+plot_ly(by_decade, x = ~decade, y = ~n, color = ~fall,
+        colors = c("Fell" = "darkgreen", "Found" = "lightblue"),
+        type = "bar") |>
+  layout(barmode = "stack",
+         xaxis = list(title = "Decade"),
+         yaxis = list(title = "Number of meteorites"),
+         legend = list(title = list(text = "Discovery")))
+```
+
+### Mass distribution (log scale)
+
+```{r}
+plot_ly(meteorites, x = ~log_mass, color = ~fall,
+        colors = c("Fell" = "darkgreen", "Found" = "lightblue"),
+        type = "histogram", nbinsx = 40, opacity = 0.7) |>
+  layout(barmode = "overlay",
+         xaxis = list(title = "log10(mass in grams)"),
+         yaxis = list(title = "Count"))
+```
+
+Explorer
+=====================================
+
+Inputs {.sidebar data-width=300}
+-------------------------------------
+
+**Filter the map, plot and table**
+
+```{r}
+filter_select("fall", "Discovery type", sd, ~fall)
+filter_select("grp", "Meteorite group", sd, ~class_group)
+filter_slider("year", "Year", sd, ~year, sep = "", step = 1)
+filter_slider("mass", "log10 mass (g)", sd, ~log_mass, step = 0.1)
+```
+
+*Fell = seen falling; Found = discovered later. A log10 mass of 3 is 1 kg; 6 is 1 tonne.*
+
+Row {data-height=400}
+-------------------------------------
+
+### Where meteorites were recorded (click clusters to zoom)
+
+```{r}
+leaflet(sd) |>
+  addProviderTiles(providers$Esri.WorldGrayCanvas) |>
+  addCircleMarkers(
+    lng = ~long, lat = ~lat,
+    radius = 5, stroke = FALSE, fillOpacity = 0.7,
+    color = ~fall_pal(fall),
+    popup = ~popup,
+    clusterOptions = markerClusterOptions()
+  ) |>
+  addLegend("bottomright", pal = fall_pal, values = c("Fell", "Found"),
+            title = "Discovery")
+```
+
+Row {data-height=500}
+-------------------------------------
+
+### Mass vs. year of recording
+
+```{r}
+plot_ly(sd, x = ~year, y = ~log_mass, color = ~class_group,
+        type = "scattergl", mode = "markers",
+        text = ~name, hoverinfo = "text+x+y",
+        marker = list(opacity = 0.5, size = 5)) |>
+  layout(
+    xaxis = list(title = "Year"),
+    yaxis = list(title = "log10(mass in grams)"),
+    legend = list(orientation = "h", y = -0.3),
+    margin = list(b = 110)
+  ) |>
+  highlight("plotly_selected")
+```
+
+### Data table
+
+```{r}
+datatable(
+  sd,
+  rownames = FALSE,
+  colnames = c("Name", "ID", "Class", "Group", "Fall", "Year", "Decade",
+               "Mass (g)", "Mass (kg)", "log10 mass", "Lat", "Long", "Popup"),
+  options = list(
+    pageLength = 5, scrollX = TRUE,
+    columnDefs = list(list(visible = FALSE, targets = c(1, 6, 8, 12)))
+  )
+)
+```
+
+Classification
+=====================================
+
+Row
+-------------------------------------
+
+### 15 most common meteorite classes
+
+```{r}
+meteorites |>
+  count(recclass, sort = TRUE) |>
+  slice_head(n = 15) |>
+  plot_ly(x = ~n, y = ~reorder(recclass, n), type = "bar",
+          orientation = "h", marker = list(color = "lightblue")) |>
+  layout(xaxis = list(title = "Number of meteorites"),
+         yaxis = list(title = ""))
+```
+
+### Mass by meteorite group
+
+```{r}
+plot_ly(meteorites, y = ~log_mass, color = ~class_group, type = "box") |>
+  layout(yaxis = list(title = "log10(mass in grams)"),
+         xaxis = list(title = ""),
+         showlegend = FALSE)
+```
+
+Row
+-------------------------------------
+
+### Share of each group among falls vs. finds
+
+```{r}
+meteorites |>
+  count(fall, class_group) |>
+  group_by(fall) |>
+  mutate(pct = n / sum(n)) |>
+  plot_ly(x = ~fall, y = ~pct, color = ~class_group, type = "bar") |>
+  layout(barmode = "stack",
+         yaxis = list(title = "Share of meteorites", tickformat = ".0%"),
+         xaxis = list(title = ""))
+```
+
+About
+=====================================
+
+### Data and notes
+
+**Source:** NASA Open Data Portal, *Meteorite Landings* (compiled from The Meteoritical Society's Meteoritical Bulletin Database).
+
+**Cleaning steps:** removed relict records, rows missing year, mass or coordinates, placeholder coordinates at (0, 0), and implausible years. Meteorite classes were grouped into broad categories for easier comparison.
+
+**Key variables:** `fall` (Fell = observed falling, Found = discovered later), `mass_g` (grams), `recclass` (classification), `year`, `lat`/`long` (decimal degrees).
+
+**Caveats:** Recording effort is uneven. Finds cluster in Antarctica and deserts where meteorites are easy to spot and preserve, and iron meteorites are over-represented among finds because they survive weathering and stand out. The interactive pages use all observed falls plus a random sample of finds.
+
+*Dashboard built with flexdashboard, plotly, leaflet, DT and crosstalk.*
